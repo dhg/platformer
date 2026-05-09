@@ -21,7 +21,7 @@
 <div id="wrap">
   <canvas id="game" width="960" height="540"></canvas>
   <div id="hud"><span id="status">—</span><span id="debug"></span></div>
-  <div id="help">← → / A D : move &nbsp;·&nbsp; Space / W / ↑ : jump (hold for higher) &nbsp;·&nbsp; R : reset &nbsp;·&nbsp; ` : debug</div>
+  <div id="help">← → / A D : move &nbsp;·&nbsp; W / ↑ : jump (hold for higher) &nbsp;·&nbsp; Space : rewind (30s) &nbsp;·&nbsp; R : reset &nbsp;·&nbsp; ` : debug</div>
 </div>
 <script>
 (() => {
@@ -44,6 +44,9 @@
   const MAX_FALL_SPEED = 900;
   const COYOTE_TIME    = 0.10;   // s after leaving ground you can still jump
   const JUMP_BUFFER    = 0.12;   // s before landing you can press jump
+
+  // Rewind
+  const HISTORY_SIZE   = 1800;   // ~30s @ 60fps
 
   // ---------- Level ----------
   // Legend:
@@ -123,6 +126,99 @@
     player.onGround = false;
     player.coyote = 0; player.jumpBuffer = 0;
     player.dead = false; player.won = false;
+    clearHistory();
+    ghost = null;
+    pendingRewindSnapshots = null;
+    confetti.length = 0;
+  }
+
+  // ---------- Rewind buffer ----------
+  // Circular buffer of player snapshots, one per update tick.
+  const history = new Array(HISTORY_SIZE);
+  let hHead = 0, hCount = 0;
+  let rewinding = false;
+
+  function pushHistory() {
+    history[hHead] = {
+      x: player.x, y: player.y,
+      vx: player.vx, vy: player.vy,
+      facing: player.facing,
+      onGround: player.onGround,
+      jumpHeld: player.jumpHeld,
+      coyote: player.coyote,
+      jumpBuffer: player.jumpBuffer,
+      won: player.won,
+      dead: player.dead,
+    };
+    hHead = (hHead + 1) % HISTORY_SIZE;
+    if (hCount < HISTORY_SIZE) hCount++;
+  }
+
+  function popHistory() {
+    if (hCount === 0) return null;
+    hHead = (hHead - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+    hCount--;
+    return history[hHead];
+  }
+
+  function clearHistory() { hHead = 0; hCount = 0; }
+
+  // ---------- Ghost replay ----------
+  // After a rewind ends, the snapshots we rewound through become a ghost that replays forward.
+  // The ghost is non-solid (50% alpha) until it stops overlapping the player, then solid (100%).
+  // At end of the path it bursts into confetti. Starting a new rewind cancels the current ghost.
+  let ghost = null;                 // { path, index, x, y, facing, solid }
+  let pendingRewindSnapshots = null;// collected during rewind, becomes ghost.path on release
+  const confetti = [];              // {x,y,vx,vy,color,life,rot,vrot}
+
+  function spawnConfetti(cx, cy) {
+    const colors = ['#ff5252', '#ffd54f', '#69f0ae', '#40c4ff', '#ea80fc', '#ffab40', '#fff'];
+    for (let i = 0; i < 36; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 120 + Math.random() * 240;
+      confetti.push({
+        x: cx, y: cy,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 140,
+        color: colors[(Math.random() * colors.length) | 0],
+        life: 0.9 + Math.random() * 0.5,
+        rot: Math.random() * Math.PI * 2,
+        vrot: (Math.random() - 0.5) * 18,
+      });
+    }
+  }
+
+  function updateConfetti(dt) {
+    for (let i = confetti.length - 1; i >= 0; i--) {
+      const p = confetti[i];
+      p.vy += 1400 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.rot += p.vrot * dt;
+      p.life -= dt;
+      if (p.life <= 0) confetti.splice(i, 1);
+    }
+  }
+
+  // Push player out of a moving solid (used when ghost moves into stationary player).
+  function pushPlayerOutOf(rect) {
+    const ox = Math.min(player.x + player.w, rect.x + rect.w) - Math.max(player.x, rect.x);
+    const oy = Math.min(player.y + player.h, rect.y + rect.h) - Math.max(player.y, rect.y);
+    if (ox <= 0 || oy <= 0) return;
+    if (ox < oy) {
+      if (player.x + player.w / 2 < rect.x + rect.w / 2) player.x = rect.x - player.w;
+      else player.x = rect.x + rect.w;
+      player.vx = 0;
+    } else {
+      if (player.y + player.h / 2 < rect.y + rect.h / 2) {
+        player.y = rect.y - player.h;
+        if (player.vy > 0) player.vy = 0;
+        player.onGround = true;
+      } else {
+        player.y = rect.y + rect.h;
+        if (player.vy < 0) player.vy = 0;
+      }
+    }
   }
 
   // ---------- Input ----------
@@ -131,7 +227,7 @@
   addEventListener('keydown', e => {
     if (e.repeat) return;
     keys.add(e.code);
-    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+    if (e.code === 'ArrowUp' || e.code === 'KeyW') {
       player.jumpBuffer = JUMP_BUFFER;
       player.jumpHeld = true;
     }
@@ -141,7 +237,7 @@
   });
   addEventListener('keyup', e => {
     keys.delete(e.code);
-    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+    if (e.code === 'ArrowUp' || e.code === 'KeyW') {
       player.jumpHeld = false;
     }
   });
@@ -166,6 +262,17 @@
       else if (dy < 0) { box.y = s.y + s.h; player.vy = 0; }
     }
 
+    // Solid ghost: same resolution as a static solid, but only when ghost has solidified
+    if (ghost && ghost.solid) {
+      const gr = { x: ghost.x, y: ghost.y, w: player.w, h: player.h };
+      if (overlaps(box, gr)) {
+        if (dx > 0) { box.x = gr.x - box.w; player.vx = 0; }
+        else if (dx < 0) { box.x = gr.x + gr.w; player.vx = 0; }
+        else if (dy > 0) { box.y = gr.y - box.h; player.vy = 0; player.onGround = true; }
+        else if (dy < 0) { box.y = gr.y + gr.h; player.vy = 0; }
+      }
+    }
+
     // One-way platforms: only resolve when moving down and feet were above the platform top
     if (dy > 0) {
       for (const p of oneways) {
@@ -183,7 +290,91 @@
 
   // ---------- Update ----------
   function update(dt) {
-    if (player.won) return;
+    updateConfetti(dt);
+
+    const rewindHeld = keys.has('Space');
+    const startedRewinding = rewindHeld && !rewinding;
+    const stoppedRewinding = !rewindHeld && rewinding;
+
+    // Starting a rewind cancels any active ghost and begins collecting snapshots.
+    if (startedRewinding) {
+      ghost = null;
+      pendingRewindSnapshots = [];
+    }
+
+    // Releasing rewind turns the collected snapshots into a forward-playing ghost.
+    if (stoppedRewinding && pendingRewindSnapshots && pendingRewindSnapshots.length > 0) {
+      pendingRewindSnapshots.reverse();
+      const first = pendingRewindSnapshots[0];
+      ghost = {
+        path: pendingRewindSnapshots,
+        index: 0,
+        x: first.x, y: first.y,
+        facing: first.facing,
+        solid: false,
+      };
+      pendingRewindSnapshots = null;
+    }
+
+    rewinding = rewindHeld;
+
+    // Rewind: Space overrides everything. Pop one snapshot per tick, freeze when buffer is empty.
+    if (rewinding) {
+      const snap = popHistory();
+      if (snap) {
+        pendingRewindSnapshots.push(snap);
+        player.x = snap.x; player.y = snap.y;
+        player.vx = snap.vx; player.vy = snap.vy;
+        player.facing = snap.facing;
+        player.onGround = snap.onGround;
+        player.jumpHeld = snap.jumpHeld;
+        player.coyote = snap.coyote;
+        player.jumpBuffer = snap.jumpBuffer;
+        player.won = snap.won;
+        player.dead = snap.dead;
+      }
+      return;
+    }
+
+    // Advance ghost along its replay path.
+    if (ghost) {
+      if (ghost.index >= ghost.path.length) {
+        spawnConfetti(ghost.x + player.w / 2, ghost.y + player.h / 2);
+        ghost = null;
+      } else {
+        const prevX = ghost.x, prevY = ghost.y;
+        // Was the player riding the ghost's head at end of last frame? (Dead players don't ride.)
+        const wasOnGhost = !player.dead && ghost.solid &&
+          player.onGround &&
+          Math.abs((player.y + player.h) - prevY) < 2 &&
+          player.x < prevX + player.w &&
+          player.x + player.w > prevX;
+
+        const g = ghost.path[ghost.index++];
+        ghost.x = g.x; ghost.y = g.y; ghost.facing = g.facing;
+
+        if (!player.dead) {
+          const gr = { x: ghost.x, y: ghost.y, w: player.w, h: player.h };
+          if (!ghost.solid) {
+            if (!overlaps(player, gr)) ghost.solid = true;
+          } else if (wasOnGhost) {
+            // Carry the rider along with the ghost; route through moveAxis so terrain still blocks.
+            const gdx = ghost.x - prevX;
+            const gdy = ghost.y - prevY;
+            if (gdx !== 0) moveAxis(gdx, 0);
+            if (gdy !== 0) moveAxis(0, gdy);
+          } else if (overlaps(player, gr)) {
+            // Ghost moved into stationary player — push player out along smallest overlap axis.
+            pushPlayerOutOf(gr);
+          }
+        }
+      }
+    }
+
+    // Dead: frozen until the player rewinds. Don't run physics, don't grow history.
+    if (player.dead) return;
+
+    if (player.won) { pushHistory(); return; }
 
     const left  = keys.has('ArrowLeft')  || keys.has('KeyA');
     const right = keys.has('ArrowRight') || keys.has('KeyD');
@@ -230,8 +421,12 @@
     moveAxis(player.vx * dt, 0);
     moveAxis(0, player.vy * dt);
 
-    // Pit / world bounds
-    if (player.y > LEVEL_H + 200) resetPlayer();
+    // Pit: burst into confetti and freeze. Player rewinds to undo (Space).
+    if (player.y + player.h > LEVEL_H) {
+      player.dead = true;
+      spawnConfetti(player.x + player.w / 2, player.y + player.h / 2);
+      return;  // skip pushHistory so the last alive frame stays at the top of the buffer
+    }
     if (player.x < 0) { player.x = 0; if (player.vx < 0) player.vx = 0; }
     if (player.x + player.w > LEVEL_W) {
       player.x = LEVEL_W - player.w;
@@ -240,6 +435,8 @@
 
     // Goal
     if (goal && overlaps(player, goal)) player.won = true;
+
+    pushHistory();
   }
 
   // ---------- Render ----------
@@ -331,19 +528,29 @@
       ctx.fill();
     }
 
+    // Ghost behind player when non-solid (so the live player reads on top through the haze).
+    if (ghost) drawGhost();
+
     // Player
     drawPlayer();
+
+    // Confetti on top of everything in the world.
+    drawConfetti();
 
     if (debug) {
       ctx.strokeStyle = '#ff0';
       ctx.strokeRect(player.x, player.y, player.w, player.h);
+      if (ghost) {
+        ctx.strokeStyle = ghost.solid ? '#0f0' : '#0ff';
+        ctx.strokeRect(ghost.x, ghost.y, player.w, player.h);
+      }
     }
 
     ctx.restore();
   }
 
-  function drawPlayer() {
-    const x = Math.round(player.x), y = Math.round(player.y);
+  function drawCharacter(px, py, facing) {
+    const x = Math.round(px), y = Math.round(py);
     // body
     ctx.fillStyle = '#e63946';
     ctx.fillRect(x, y + 8, player.w, player.h - 8);
@@ -356,7 +563,7 @@
     ctx.fillRect(x - 2, y + 3, player.w + 4, 3);
     // eye
     ctx.fillStyle = '#000';
-    const eyeX = player.facing > 0 ? x + player.w - 8 : x + 6;
+    const eyeX = facing > 0 ? x + player.w - 8 : x + 6;
     ctx.fillRect(eyeX, y + 6, 2, 3);
     // shoes
     ctx.fillStyle = '#3b2a1a';
@@ -364,10 +571,37 @@
     ctx.fillRect(x + player.w - 8, y + player.h - 4, 8, 4);
   }
 
+  function drawPlayer() {
+    if (player.dead) return;
+    drawCharacter(player.x, player.y, player.facing);
+  }
+
+  function drawGhost() {
+    ctx.save();
+    ctx.globalAlpha = ghost.solid ? 1.0 : 0.5;
+    drawCharacter(ghost.x, ghost.y, ghost.facing);
+    ctx.restore();
+  }
+
+  function drawConfetti() {
+    for (const p of confetti) {
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.globalAlpha = Math.max(0, Math.min(1, p.life * 1.5));
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-3, -2, 6, 4);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+
   function drawHUD() {
     const status = document.getElementById('status');
     const dbg = document.getElementById('debug');
-    if (player.won) status.textContent = 'You reached the goal! Press R to restart.';
+    if (rewinding) status.textContent = `◀◀ REWIND  (${(hCount / 60).toFixed(1)}s left)`;
+    else if (player.dead) status.textContent = 'You burst into confetti — hold Space to rewind';
+    else if (player.won) status.textContent = 'You reached the goal! Press R to restart.';
     else status.textContent = 'Get to the flag →';
     if (debug) {
       dbg.textContent =
@@ -390,6 +624,10 @@
     updateCamera();
     drawSky();
     drawWorld();
+    if (rewinding) {
+      ctx.fillStyle = 'rgba(80, 140, 255, 0.20)';
+      ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    }
     drawHUD();
 
     requestAnimationFrame(frame);
