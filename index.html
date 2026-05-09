@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Platformer Prototype</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #1a1a1a; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; font-family: -apple-system, sans-serif; color: #ddd; }
+  #wrap { position: relative; }
+  canvas { display: block; background: #6cb4ff; image-rendering: pixelated; box-shadow: 0 4px 20px rgba(0,0,0,.5); }
+  #hud {
+    position: absolute; top: 8px; left: 12px; right: 12px;
+    display: flex; justify-content: space-between; pointer-events: none;
+    font: 12px/1 ui-monospace, monospace; color: #fff;
+    text-shadow: 1px 1px 0 #000;
+  }
+  #help { position: absolute; bottom: 8px; left: 12px; font: 11px/1.4 ui-monospace, monospace; color: #fff; text-shadow: 1px 1px 0 #000; opacity: .85; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+  <div id="hud"><span id="status">—</span><span id="debug"></span></div>
+  <div id="help">← → / A D : move &nbsp;·&nbsp; Space / W / ↑ : jump (hold for higher) &nbsp;·&nbsp; R : reset &nbsp;·&nbsp; ` : debug</div>
+</div>
+<script>
+(() => {
+  // ---------- Constants (tune these) ----------
+  const TILE = 32;
+  const VIEW_W = 960, VIEW_H = 540;
+
+  // Movement
+  const MOVE_ACCEL     = 1800;   // px/s^2 ground
+  const AIR_ACCEL      = 1400;   // px/s^2 air
+  const MAX_RUN_SPEED  = 260;    // px/s
+  const GROUND_FRICTION = 1600;  // px/s^2 when no input
+  const TURN_BOOST     = 3.0;    // multiplier when reversing direction
+
+  // Jump
+  const GRAVITY        = 2200;   // px/s^2
+  const FALL_GRAVITY   = 2800;   // stronger when falling -> snappier
+  const LOW_JUMP_GRAV  = 3400;   // when jump released early
+  const JUMP_VELOCITY  = 720;    // initial upward velocity
+  const MAX_FALL_SPEED = 900;
+  const COYOTE_TIME    = 0.10;   // s after leaving ground you can still jump
+  const JUMP_BUFFER    = 0.12;   // s before landing you can press jump
+
+  // ---------- Level ----------
+  // Legend:
+  //   . empty   # solid block   = one-way (top-only) platform
+  //   P player spawn            G goal flag
+  //   (pits are just gaps in the floor)
+  const LEVEL = [
+    "................................................................................................",
+    "................................................................................................",
+    "................................................................................................",
+    "................................................................................................",
+    "................................................................................................",
+    "................................................................................................",
+    "................................................................................................",
+    "................................................................................................",
+    "................................................................................................",
+    ".........................................====.......................====........................",
+    ".......P.......................................................................................G",
+    "................................................................................................",
+    "###############....#####################.......####################......#######################",
+    "###############....#####################.......####################......#######################",
+    "###############....#####################.......####################......#######################",
+    "###############....#####################.......####################......#######################",
+    "###############....#####################.......####################......#######################",
+    "###############....#####################.......####################......#######################",
+  ];
+
+  const LEVEL_W = LEVEL[0].length * TILE;
+  const LEVEL_H = LEVEL.length * TILE;
+
+  // Build solid + one-way arrays for fast collision
+  const solids = [];   // {x,y,w,h}
+  const oneways = [];  // top-only
+  let spawn = { x: 64, y: 64 };
+  let goal  = null;
+  for (let r = 0; r < LEVEL.length; r++) {
+    for (let c = 0; c < LEVEL[r].length; c++) {
+      const ch = LEVEL[r][c];
+      const x = c * TILE, y = r * TILE;
+      if (ch === '#') solids.push({ x, y, w: TILE, h: TILE });
+      else if (ch === '=') oneways.push({ x, y, w: TILE, h: 8 });
+      else if (ch === 'P') spawn = { x: x + 4, y: y };
+      else if (ch === 'G') goal = { x, y, w: TILE, h: TILE * 2 };
+    }
+  }
+
+  // Merge horizontally adjacent solids in the same row to reduce checks (and seams)
+  // (cheap pass — O(n^2) is fine for prototype)
+  solids.sort((a, b) => a.y - b.y || a.x - b.x);
+  const merged = [];
+  for (const s of solids) {
+    const last = merged[merged.length - 1];
+    if (last && last.y === s.y && last.h === s.h && last.x + last.w === s.x) {
+      last.w += s.w;
+    } else {
+      merged.push({ ...s });
+    }
+  }
+
+  // ---------- Player ----------
+  const player = {
+    x: spawn.x, y: spawn.y,
+    w: 24, h: 32,
+    vx: 0, vy: 0,
+    onGround: false,
+    facing: 1,
+    coyote: 0,
+    jumpBuffer: 0,
+    jumpHeld: false,
+    dead: false,
+    won: false,
+  };
+
+  function resetPlayer() {
+    player.x = spawn.x; player.y = spawn.y;
+    player.vx = 0; player.vy = 0;
+    player.onGround = false;
+    player.coyote = 0; player.jumpBuffer = 0;
+    player.dead = false; player.won = false;
+  }
+
+  // ---------- Input ----------
+  const keys = new Set();
+  let debug = false;
+  addEventListener('keydown', e => {
+    if (e.repeat) return;
+    keys.add(e.code);
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+      player.jumpBuffer = JUMP_BUFFER;
+      player.jumpHeld = true;
+    }
+    if (e.code === 'KeyR') resetPlayer();
+    if (e.code === 'Backquote') debug = !debug;
+    if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  });
+  addEventListener('keyup', e => {
+    keys.delete(e.code);
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+      player.jumpHeld = false;
+    }
+  });
+
+  // ---------- Collision helpers ----------
+  function overlaps(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x &&
+           a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  // Move player on one axis, resolving collisions.
+  function moveAxis(dx, dy) {
+    player.x += dx; player.y += dy;
+    const box = player;
+
+    // Solid blocks: resolve on both axes
+    for (const s of merged) {
+      if (!overlaps(box, s)) continue;
+      if (dx > 0) { box.x = s.x - box.w; player.vx = 0; }
+      else if (dx < 0) { box.x = s.x + s.w; player.vx = 0; }
+      else if (dy > 0) { box.y = s.y - box.h; player.vy = 0; player.onGround = true; }
+      else if (dy < 0) { box.y = s.y + s.h; player.vy = 0; }
+    }
+
+    // One-way platforms: only resolve when moving down and feet were above the platform top
+    if (dy > 0) {
+      for (const p of oneways) {
+        if (!overlaps(box, p)) continue;
+        // feet were above the platform top before this step?
+        const prevFeet = box.y + box.h - dy;
+        if (prevFeet <= p.y + 0.5) {
+          box.y = p.y - box.h;
+          player.vy = 0;
+          player.onGround = true;
+        }
+      }
+    }
+  }
+
+  // ---------- Update ----------
+  function update(dt) {
+    if (player.won) return;
+
+    const left  = keys.has('ArrowLeft')  || keys.has('KeyA');
+    const right = keys.has('ArrowRight') || keys.has('KeyD');
+    const dir = (right ? 1 : 0) - (left ? 1 : 0);
+
+    // Horizontal accel
+    const accel = player.onGround ? MOVE_ACCEL : AIR_ACCEL;
+    if (dir !== 0) {
+      player.facing = dir;
+      // Boost when reversing for snappy feel
+      const reversing = (dir > 0 && player.vx < 0) || (dir < 0 && player.vx > 0);
+      const a = accel * (reversing ? TURN_BOOST : 1);
+      player.vx += dir * a * dt;
+      player.vx = Math.max(-MAX_RUN_SPEED, Math.min(MAX_RUN_SPEED, player.vx));
+    } else if (player.onGround) {
+      // Friction
+      const sign = Math.sign(player.vx);
+      const drop = GROUND_FRICTION * dt;
+      if (Math.abs(player.vx) <= drop) player.vx = 0;
+      else player.vx -= sign * drop;
+    }
+
+    // Coyote + jump buffer
+    if (player.onGround) player.coyote = COYOTE_TIME;
+    else player.coyote = Math.max(0, player.coyote - dt);
+    player.jumpBuffer = Math.max(0, player.jumpBuffer - dt);
+
+    if (player.jumpBuffer > 0 && player.coyote > 0) {
+      player.vy = -JUMP_VELOCITY;
+      player.onGround = false;
+      player.coyote = 0;
+      player.jumpBuffer = 0;
+    }
+
+    // Variable gravity: low-jump cut, snappier fall
+    let g = GRAVITY;
+    if (player.vy < 0 && !player.jumpHeld) g = LOW_JUMP_GRAV;
+    else if (player.vy > 0) g = FALL_GRAVITY;
+    player.vy += g * dt;
+    if (player.vy > MAX_FALL_SPEED) player.vy = MAX_FALL_SPEED;
+
+    // Move (resolve X then Y so corners feel right)
+    player.onGround = false;
+    moveAxis(player.vx * dt, 0);
+    moveAxis(0, player.vy * dt);
+
+    // Pit / world bounds
+    if (player.y > LEVEL_H + 200) resetPlayer();
+    if (player.x < 0) { player.x = 0; if (player.vx < 0) player.vx = 0; }
+    if (player.x + player.w > LEVEL_W) {
+      player.x = LEVEL_W - player.w;
+      if (player.vx > 0) player.vx = 0;
+    }
+
+    // Goal
+    if (goal && overlaps(player, goal)) player.won = true;
+  }
+
+  // ---------- Render ----------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+
+  let camX = 0, camY = 0;
+  function updateCamera() {
+    // Center on player with deadzone clamping to level bounds
+    const targetX = player.x + player.w / 2 - VIEW_W / 2;
+    const targetY = player.y + player.h / 2 - VIEW_H / 2;
+    camX = Math.max(0, Math.min(LEVEL_W - VIEW_W, targetX));
+    camY = Math.max(0, Math.min(LEVEL_H - VIEW_H, targetY));
+  }
+
+  function drawSky() {
+    const g = ctx.createLinearGradient(0, 0, 0, VIEW_H);
+    g.addColorStop(0, '#6cb4ff');
+    g.addColorStop(1, '#bfe0ff');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+    // Parallax clouds
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    for (let i = 0; i < 8; i++) {
+      const cx = ((i * 220) - camX * 0.3) % (LEVEL_W + 400);
+      const x = cx < -200 ? cx + LEVEL_W + 400 : cx;
+      const y = 60 + (i % 3) * 40;
+      ctx.beginPath();
+      ctx.arc(x, y, 18, 0, Math.PI * 2);
+      ctx.arc(x + 18, y - 8, 22, 0, Math.PI * 2);
+      ctx.arc(x + 38, y, 18, 0, Math.PI * 2);
+      ctx.arc(x + 20, y + 8, 18, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawWorld() {
+    ctx.save();
+    ctx.translate(-camX, -camY);
+
+    // Solid blocks (brick-like)
+    for (const s of merged) {
+      // skip offscreen
+      if (s.x + s.w < camX || s.x > camX + VIEW_W) continue;
+      if (s.y + s.h < camY || s.y > camY + VIEW_H) continue;
+
+      ctx.fillStyle = '#7a4a1c';
+      ctx.fillRect(s.x, s.y, s.w, s.h);
+      ctx.fillStyle = '#5e3712';
+      ctx.fillRect(s.x, s.y + s.h - 4, s.w, 4);
+      // top grass if it's the top row of a stack
+      ctx.fillStyle = '#3fa84a';
+      ctx.fillRect(s.x, s.y, s.w, 6);
+      ctx.fillStyle = '#2f8a3a';
+      ctx.fillRect(s.x, s.y + 6, s.w, 2);
+
+      // Brick lines
+      ctx.strokeStyle = 'rgba(0,0,0,0.18)';
+      ctx.lineWidth = 1;
+      for (let y = s.y + TILE; y < s.y + s.h; y += TILE) {
+        ctx.beginPath(); ctx.moveTo(s.x, y); ctx.lineTo(s.x + s.w, y); ctx.stroke();
+      }
+      for (let x = s.x + TILE; x < s.x + s.w; x += TILE) {
+        ctx.beginPath(); ctx.moveTo(x, s.y); ctx.lineTo(x, s.y + s.h); ctx.stroke();
+      }
+    }
+
+    // One-way platforms
+    for (const p of oneways) {
+      if (p.x + p.w < camX || p.x > camX + VIEW_W) continue;
+      ctx.fillStyle = '#caa15a';
+      ctx.fillRect(p.x, p.y, p.w, p.h);
+      ctx.fillStyle = '#8a6a32';
+      ctx.fillRect(p.x, p.y + p.h - 2, p.w, 2);
+    }
+
+    // Goal flag
+    if (goal) {
+      ctx.fillStyle = '#444';
+      ctx.fillRect(goal.x + goal.w / 2 - 2, goal.y, 4, goal.h);
+      ctx.fillStyle = player.won ? '#ffd84a' : '#e84a4a';
+      ctx.beginPath();
+      ctx.moveTo(goal.x + goal.w / 2 + 2, goal.y + 4);
+      ctx.lineTo(goal.x + goal.w / 2 + 26, goal.y + 12);
+      ctx.lineTo(goal.x + goal.w / 2 + 2, goal.y + 20);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // Player
+    drawPlayer();
+
+    if (debug) {
+      ctx.strokeStyle = '#ff0';
+      ctx.strokeRect(player.x, player.y, player.w, player.h);
+    }
+
+    ctx.restore();
+  }
+
+  function drawPlayer() {
+    const x = Math.round(player.x), y = Math.round(player.y);
+    // body
+    ctx.fillStyle = '#e63946';
+    ctx.fillRect(x, y + 8, player.w, player.h - 8);
+    // head
+    ctx.fillStyle = '#f4d29a';
+    ctx.fillRect(x + 4, y, player.w - 8, 12);
+    // hat
+    ctx.fillStyle = '#b3001b';
+    ctx.fillRect(x + 2, y, player.w - 4, 5);
+    ctx.fillRect(x - 2, y + 3, player.w + 4, 3);
+    // eye
+    ctx.fillStyle = '#000';
+    const eyeX = player.facing > 0 ? x + player.w - 8 : x + 6;
+    ctx.fillRect(eyeX, y + 6, 2, 3);
+    // shoes
+    ctx.fillStyle = '#3b2a1a';
+    ctx.fillRect(x, y + player.h - 4, 8, 4);
+    ctx.fillRect(x + player.w - 8, y + player.h - 4, 8, 4);
+  }
+
+  function drawHUD() {
+    const status = document.getElementById('status');
+    const dbg = document.getElementById('debug');
+    if (player.won) status.textContent = 'You reached the goal! Press R to restart.';
+    else status.textContent = 'Get to the flag →';
+    if (debug) {
+      dbg.textContent =
+        `x:${player.x.toFixed(0)} y:${player.y.toFixed(0)} ` +
+        `vx:${player.vx.toFixed(0)} vy:${player.vy.toFixed(0)} ` +
+        `g:${player.onGround ? 1 : 0}`;
+    } else {
+      dbg.textContent = '';
+    }
+  }
+
+  // ---------- Loop ----------
+  let last = performance.now();
+  function frame(now) {
+    let dt = (now - last) / 1000;
+    last = now;
+    if (dt > 0.05) dt = 0.05; // clamp big stalls
+
+    update(dt);
+    updateCamera();
+    drawSky();
+    drawWorld();
+    drawHUD();
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
